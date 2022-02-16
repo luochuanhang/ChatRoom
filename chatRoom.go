@@ -1,88 +1,26 @@
 package main
 
 import (
+	"database/sql"
 	"fmt"
+	_ "github.com/go-sql-driver/mysql"
 	"net"
 	"strings"
 	"time"
 )
 
-//用户结构体
+var defaultDB *sql.DB
+
+// 创建用户结构体类型！
 type Client struct {
 	C    chan string
 	Name string
 	Addr string
 }
-
-//在线用户列表
-var onlineMap map[string]Client
-
-//消息通道
-var message chan string
-
-func main() {
-	//创建监听套接字
-	listener, err := net.Listen("tcp", "127.0.0.1:8008")
-	if err != nil {
-		fmt.Println("net.listen err", err)
-		return
-	}
-	defer listener.Close()
-	go Message()
-	//循环监听客户端连接请求
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			fmt.Println("listener.accept err", err)
-			return
-		}
-		//处理用户信息
-		go HandlerConnet(conn)
-	}
-}
-
-func Message() {
-	onlineMap = make(map[string]Client)
-	for {
-		msg := <-message
-		for _, clin := range onlineMap {
-			clin.C <- msg
-		}
-	}
-}
-
-func HandlerConnet(conn net.Conn) {
-	defer conn.Close()
-	addrName := conn.RemoteAddr().String()
-	clin := Client{message, addrName, addrName}
-	//将新连接用户添加到map中
-	onlineMap[addrName] = clin
-	//创建WriteMsgToClient给用户发信息
-	go WriteMsgToClient(conn, clin)
-	message <- clin.Name + "上线了"
-	for {
-
-	}
-}
-
-func WriteMsgToClient(conn net.Conn, client Client) {
-	for mes := range client.C {
-		conn.Write([]byte(mes + "\n"))
-	}
-}
-package main
-
-import (
-"net"
-"fmt"
-"strings"
-"time"
-)
-// 创建用户结构体类型！
-type Client struct {
-	C chan string
-	Name string
-	Addr string
+type mess struct {
+	id   int    `json:"id,omitempty"`
+	me   string `json:"record,omitempty"`
+	time string `json:"time,omitempty"`
 }
 
 // 创建全局map，存储在线用户
@@ -91,7 +29,7 @@ var onlineMap map[string]Client
 // 创建全局 channel 传递用户消息。
 var message = make(chan string)
 
-func WriteMsgToClient(clnt Client, conn net.Conn)  {
+func WriteMsgToClient(clnt Client, conn net.Conn) {
 	// 监听 用户自带Channel 上是否有消息。
 	for msg := range clnt.C {
 		conn.Write([]byte(msg + "\n"))
@@ -103,7 +41,7 @@ func MakeMsg(clnt Client, msg string) (buf string) {
 	return
 }
 
-func HandlerConnect(conn net.Conn)  {
+func HandlerConnect(conn net.Conn) {
 	defer conn.Close()
 	// 创建channel 判断，用户是否活跃。
 	hasData := make(chan bool)
@@ -152,12 +90,16 @@ func HandlerConnect(conn net.Conn)  {
 					conn.Write([]byte(userInfo))
 				}
 				// 判断用户发送了 改名 命令
-			} else if len(msg) >=8 && msg[:6] == "rename" {		// rename|
-				newName := strings.Split(msg, "|")[1]		// msg[8:]
-				clnt.Name = newName								// 修改结构体成员name
-				onlineMap[netAddr] = clnt						// 更新 onlineMap
+			} else if len(msg) >= 8 && msg[:6] == "rename" { // rename|
+				newName := strings.Split(msg, "|")[1] // msg[8:]
+				clnt.Name = newName                   // 修改结构体成员name
+				onlineMap[netAddr] = clnt             // 更新 onlineMap
 				conn.Write([]byte("rename successful\n"))
-			}else {
+			} else if msg == "record" {
+				list(conn)
+			} else if msg == "delete" {
+				delect(conn)
+			} else {
 				// 将读到的用户消息，写入到message中。
 				message <- MakeMsg(clnt, msg)
 			}
@@ -170,27 +112,28 @@ func HandlerConnect(conn net.Conn)  {
 		// 监听 channel 上的数据流动
 		select {
 		case <-isQuit:
-			delete(onlineMap, clnt.Addr)		// 将用户从 online移除
-			message <- MakeMsg(clnt, "logout")   // 写入用户退出消息到全局channel
+			delete(onlineMap, clnt.Addr)       // 将用户从 online移除
+			message <- MakeMsg(clnt, "logout") // 写入用户退出消息到全局channel
 			return
 		case <-hasData:
 			// 什么都不做。 目的是重置 下面 case 的计时器。
 		case <-time.After(time.Second * 60):
-			delete(onlineMap, clnt.Addr)       // 将用户从 online移除
+			delete(onlineMap, clnt.Addr)                // 将用户从 online移除
 			message <- MakeMsg(clnt, "time out leaved") // 写入用户退出消息到全局channel
 			return
 		}
 	}
 }
 
-func Manager()  {
+func Manager() {
 	// 初始化 onlineMap
 	onlineMap = make(map[string]Client)
 
 	// 监听全局channel 中是否有数据, 有数据存储至 msg， 无数据阻塞。
 	for {
 		msg := <-message
-
+		fmt.Println(msg)
+		post(msg)
 		// 循环发送消息给 所有在线用户。要想执行，必须 msg := <-message 执行完， 解除阻塞。
 		for _, clnt := range onlineMap {
 			clnt.C <- msg
@@ -198,7 +141,7 @@ func Manager()  {
 	}
 }
 
-func main()  {
+func main() {
 	// 创建监听套接字
 	listener, err := net.Listen("tcp", "127.0.0.1:8000")
 	if err != nil {
@@ -220,4 +163,63 @@ func main()  {
 		// 启动go程处理客户端数据请求
 		go HandlerConnect(conn)
 	}
+}
+
+//连接数据库
+func database() *sql.DB {
+	if defaultDB == nil {
+		db, err := sql.Open("mysql", "root:root@tcp(127.0.0.1:3306)/chatroom")
+		if err != nil {
+			panic(err)
+		}
+		if err := db.Ping(); err != nil {
+			panic(err)
+		}
+		defaultDB = db
+	}
+	return defaultDB
+}
+
+// 存放聊天记录
+func post(msg string) {
+	db := database()
+	stmt, err := db.Prepare("INSERT INTO chatroom (record,time) VALUES (?,?)")
+	if err != nil {
+		panic(err)
+	}
+	_, err = stmt.Exec(msg, time.Now())
+	if err != nil {
+		panic(err)
+	}
+}
+
+// 查询聊天记录
+func list(conn net.Conn) {
+	db := database()
+	rows, err := db.Query("select * from chatroom")
+	if err != nil {
+		panic(err)
+	}
+	defer rows.Close()
+	fmt.Println(rows.Columns())
+	for rows.Next() {
+		var s mess
+		rows.Scan(&s.id, &s.me, &s.time)
+		fmt.Println(s.id, s.me, s.time)
+		conn.Write([]byte(s.time + s.me + "\n"))
+	}
+}
+
+// 删除聊天记录
+func delect(conn net.Conn) {
+	db := database()
+	r, err := db.Exec("truncate table chatroom")
+	if err != nil {
+		panic(err)
+	}
+	n, _ := r.RowsAffected()
+	fmt.Println("删除", n, "条")
+	fmt.Println("删除成功")
+	conn.Write([]byte("删除记录成功"))
+
 }
